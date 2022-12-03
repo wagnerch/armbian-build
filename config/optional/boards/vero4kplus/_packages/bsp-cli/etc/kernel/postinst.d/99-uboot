@@ -1,0 +1,15 @@
+#!/bin/sh
+# echo "DEBUG: postinst: initramfs-clean: cmd: $@" >&2
+# avoid running multiple times
+# This script should be run after the initramfs-tools script
+# and under the same conditions.
+if [ -n "$DEB_MAINT_PARAMS" ]; then
+	eval set -- "$DEB_MAINT_PARAMS"
+	if [ -z "$1" ] || [ "$1" != "configure" ]; then
+		exit 0
+	fi
+fi
+
+mkimage -A arm64 -O linux -T kernel -C none -a 0x1080000 -e 0x1080000 -n "Linux" -d /boot/vmlinuz-* /boot/uImage  > /dev/null 2>&1
+
+exit 0
