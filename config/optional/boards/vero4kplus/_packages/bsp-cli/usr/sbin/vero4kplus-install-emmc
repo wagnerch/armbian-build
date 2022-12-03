@@ -1,0 +1,267 @@
+#!/bin/bash
+# vero4kplus-install-emmc: move a running Armbian (SD/USB) install onto the eMMC of an OSMC Vero 4K+,
+# KEEPING the vendor bootloader and environment, and chainloading mainline U-Boot from it.
+#
+#   ROM -> vendor BL2/BL3x -> vendor U-Boot -> emmc_autoscript (mmc 1) -> u-boot.ext (mainline) -> Armbian
+#
+# What it does to the eMMC (everything else is left untouched; sizes for a 16GB unit):
+#   KEPT     0-4MiB bootloader, 36-100MiB reserved/MPT, 628-636MiB env, logo, recovery, rsv, tee, crypt, misc, boot
+#   WIPED    OSMC's LVM volume group "vero-nand" (one logical volume "root" spanning the cache, instaboot,
+#            system and data partitions) - i.e. the whole OSMC installation
+#   CREATED  p1 FAT32 /boot at 836MiB (512MiB, the old "instaboot"), p2 ext4 root from 1396MiB to the end
+#   WRITTEN  only bytes 446-511 of sector 0 (the DOS partition table); the vendor MPT is NOT rewritten.
+#
+# Recovery if the eMMC does not boot: boot from SD with the stock bootloader (boot@SDC dongle), then restore
+# the backup this script takes first (dd bs=1M of=/dev/mmcblkX < emmc-first-836MiB.img).
+set -euo pipefail
+
+MiB=$((1024*1024))
+P1_START_MIB=836;  P1_SIZE_MIB=512
+P2_START_MIB=1396
+EXPECTED_PARTS="bootloader:0 reserved:36 cache:108 env:628 logo:644 recovery:684 rsv:724 tee:740 crypt:756 misc:796 instaboot:836 boot:1356 system:1396 data:2428"
+# regions we promise not to touch (MiB ranges, plus sector 0 bytes 0-445 and 512-end handled separately)
+KEEP_RANGES="36:100 628:636 644:828"
+OLD_PV_MIB="108 836 1396 2428"   # LVM physical volume starts (cache, instaboot, system, data)
+
+DEVICE=""; DEVICE_GIVEN=0; BACKUP_DIR=""; NO_BACKUP=0; DRY=0; YES=0; REINSTALL=0
+MNT=/mnt/vero4kplus-emmc
+LOG=/var/log/vero4kplus-install-emmc.log
+
+usage() { cat <<EOF
+Usage: $0 [--device /dev/mmcblkN] (--backup-dir DIR | --no-backup) [--dry-run] [--reinstall] [--yes]
+  --device      eMMC block device (autodetected if there is exactly one MMC device that is not the boot disk)
+  --backup-dir  directory (NOT on the eMMC) that receives a copy of the first 836MiB of the eMMC
+  --no-backup   skip the backup (asks for an extra confirmation)
+  --dry-run     run every check and print the plan, write nothing
+  --reinstall   allow re-running over a previous run of this installer
+  --yes         do not prompt (only honoured together with --device)
+EOF
+}
+die() { echo "ERROR: $*" >&2; exit 1; }
+say() { echo "== $*" | tee -a "$LOG" >&2; }
+run() { echo "+ $*" >> "$LOG"; if [ "$DRY" = 1 ]; then echo "[dry-run] $*" >&2; else "$@"; fi; }
+
+while [ $# -gt 0 ]; do case "$1" in
+  --device) DEVICE="$2"; DEVICE_GIVEN=1; shift 2;; --backup-dir) BACKUP_DIR="$2"; shift 2;; --no-backup) NO_BACKUP=1; shift;;
+  --dry-run|--check) DRY=1; shift;; --reinstall) REINSTALL=1; shift;; --yes) YES=1; shift;;
+  -h|--help) usage; exit 0;; *) usage; die "unknown argument: $1";; esac; done
+
+[ "$(id -u)" = 0 ] || die "run as root"
+[ "$DRY" = 1 ] || [ -n "$BACKUP_DIR" ] || [ "$NO_BACKUP" = 1 ] || die "give --backup-dir DIR (not on the eMMC) or --no-backup"
+[ -z "$BACKUP_DIR" ] || [ "$NO_BACKUP" = 0 ] || die "--backup-dir and --no-backup contradict each other"
+: > "$LOG" 2>/dev/null || LOG=/tmp/vero4kplus-install-emmc.log
+for t in sfdisk mkfs.vfat mkfs.ext4 rsync blkid findmnt dd sha256sum mkimage fsck.vfat e2fsck truncate udevadm python3 lsblk; do
+  command -v "$t" >/dev/null || die "missing tool: $t (apt install fdisk dosfstools e2fsprogs rsync u-boot-tools python3 util-linux)"; done
+
+# ---------- guard 1: this must be a Vero 4K+ ----------
+tr '\0' '\n' < /proc/device-tree/compatible 2>/dev/null | grep -qx 'osmc,vero4k-plus' \
+  || die "this is not an OSMC Vero 4K+ (device-tree compatible lacks osmc,vero4k-plus); refusing"
+
+# ---------- guard 2: find and identify the eMMC ----------
+base_of() { lsblk -no PKNAME "$1" 2>/dev/null | head -1; }
+ROOT_SRC=$(findmnt -rn -o SOURCE /); BOOT_SRC=$(findmnt -rn -o SOURCE /boot || true)
+ROOT_DISK=/dev/$(base_of "$ROOT_SRC"); [ -n "$BOOT_SRC" ] && BOOT_DISK=/dev/$(base_of "$BOOT_SRC") || BOOT_DISK=""
+cands=()
+for b in /sys/block/mmcblk[0-9]*; do
+  n=$(basename "$b"); case "$n" in *boot*|*rpmb*) continue;; esac
+  [ "$(cat "$b/device/type" 2>/dev/null)" = MMC ] && cands+=("/dev/$n")
+done
+if [ -z "$DEVICE" ]; then
+  [ "${#cands[@]}" = 1 ] || die "cannot autodetect the eMMC (found: ${cands[*]:-none}); pass --device"
+  DEVICE=${cands[0]}
+fi
+[ -b "$DEVICE" ] || die "$DEVICE is not a block device"
+printf '%s\n' "${cands[@]}" | grep -qx "$DEVICE" || die "$DEVICE is not an MMC (eMMC) device; refusing"
+N=$(basename "$DEVICE"); [ -e "/sys/block/$N/${N}boot0" ] || [ -e "/dev/${N}boot0" ] || die "$DEVICE has no boot partitions, not an eMMC; refusing"
+[ "$DEVICE" != "$ROOT_DISK" ] && [ "$DEVICE" != "$BOOT_DISK" ] || die "$DEVICE holds the running system; boot from SD/USB first"
+grep -q "^$DEVICE" /proc/mounts && die "something on $DEVICE is mounted; unmount it first"
+grep -q "^$DEVICE" /proc/swaps && die "$DEVICE is used as swap"
+SECTORS=$(cat /sys/block/$N/size); [ "$SECTORS" -ge $((8*1024*MiB/512)) ] || die "$DEVICE is smaller than 8GiB"
+
+# ---------- guard 3: vendor bootloader, MPT layout and vendor environment ----------
+[ "$(dd if=$DEVICE bs=1 skip=$((512+0x10)) count=4 status=none)" = "@AML" ] \
+  || die "no Amlogic BL2 header at sector 1: the vendor bootloader is not on the eMMC user area; refusing (would not boot)"
+MPT_CHECK=$(python3 -I - "$DEVICE" "$EXPECTED_PARTS" <<'PY'
+import struct,sys
+dev,exp=sys.argv[1],dict(p.split(':') for p in sys.argv[2].split())
+f=open(dev,'rb'); f.seek(36<<20); d=f.read(4096)
+if d[:4]!=b'MPT\0' or not d[4:12].startswith(b'01.00.00'): print("no Amlogic MPT v01.00.00 at 36MiB"); sys.exit(0)
+n=struct.unpack('<I',d[16:20])[0]
+if n!=len(exp): print("MPT has %d partitions, expected %d"%(n,len(exp))); sys.exit(0)
+for i in range(n):
+    e=d[24+40*i:64+40*i]; name=e[:16].split(b'\0')[0].decode()
+    size,off=struct.unpack('<QQ',e[16:32])
+    if name not in exp or off!=int(exp[name])*(1<<20): print("unexpected MPT entry %s at %d MiB"%(name,off>>20)); sys.exit(0)
+print("OK")
+PY
+)
+[ "$MPT_CHECK" = OK ] || die "eMMC partition table is not the stock OSMC layout: $MPT_CHECK"
+ENV_CHECK=$(python3 -I - "$DEVICE" <<'PY'
+import struct,sys,zlib
+f=open(sys.argv[1],'rb'); f.seek(628<<20); d=f.read(0x10000)
+if zlib.crc32(d[4:])&0xffffffff!=struct.unpack('<I',d[:4])[0]: print("vendor U-Boot environment CRC is invalid"); sys.exit(0)
+v=dict(x.split(b'=',1) for x in d[4:].split(b'\0') if b'=' in x)
+bc=v.get(b'bootcmd',b'').decode(); se=v.get(b'start_emmc_autoscript',b'').decode(); sa=v.get(b'start_autoscript',b'').decode()
+if 'start_autoscript' not in bc or 'start_emmc_autoscript' not in sa or 'fatload mmc 1' not in se or 'emmc_autoscript' not in se:
+    print("vendor environment does not run emmc_autoscript (bootcmd=%r). Run Armbian's aml_autoscript from the vendor U-Boot first"%bc); sys.exit(0)
+print("OK")
+PY
+)
+[ "$ENV_CHECK" = OK ] || die "$ENV_CHECK"
+
+# ---------- guard 4: what is on the eMMC from 836MiB on? ----------
+dos_sig=$(dd if="$DEVICE" bs=1 skip=510 count=2 status=none | od -An -tx1 | tr -d ' \n')
+if [ "$dos_sig" = "55aa" ]; then
+  p1=$(sfdisk -d "$DEVICE" 2>/dev/null | sed -n 's/.*start= *\([0-9]*\),.*/\1/p' | head -1)
+  if [ "$p1" = "$((P1_START_MIB*MiB/512))" ] && [ "$REINSTALL" = 1 ]; then say "previous installation found, --reinstall given"
+  elif [ "$p1" = "$((P1_START_MIB*MiB/512))" ]; then die "a previous installation of this script is on $DEVICE; use --reinstall to overwrite it"
+  else die "$DEVICE already has a DOS partition table that is not ours (first partition at sector ${p1:-?}); refusing"; fi
+fi
+pv_found=""
+# tr drops NUL bytes (zeroed sectors) so bash does not warn about them in the command substitution
+for m in $OLD_PV_MIB; do [ "$(dd if=$DEVICE bs=512 skip=$((m*MiB/512+1)) count=1 status=none | head -c 8 | tr -d '\0')" = "LABELONE" ] && pv_found="$pv_found ${m}MiB"; done
+if [ -n "$pv_found" ]; then lvm_msg="OSMC LVM volume group (PV labels found at:${pv_found})"
+else lvm_msg="no OSMC LVM labels found (the target looks like an earlier install of this script)"; fi
+
+# ---------- guard 5: the source system ----------
+for f in /boot/u-boot.ext /boot/boot.scr /boot/armbianEnv.txt /boot/dtb/amlogic/meson-gxl-s905d-vero4k-plus.dtb; do
+  [ -s "$f" ] || die "source system is missing $f"; done
+[ "$(stat -c %s /boot/u-boot.ext)" -le $MiB ] || die "/boot/u-boot.ext is larger than 1MiB (vendor BL2 limit); refusing"
+ls /boot/Image /boot/uImage /boot/vmlinuz-* >/dev/null 2>&1 || die "no kernel in /boot"
+ROOT_USED=$(df -B1 --output=used / | tail -1)
+P2_SECTORS=$(( ((SECTORS - P2_START_MIB*MiB/512) / (MiB/512)) * (MiB/512) ))
+[ "$ROOT_USED" -lt $(( P2_SECTORS*512*8/10 )) ] || die "the running root ($((ROOT_USED/MiB))MiB used) will not fit the new root partition"
+
+# ---------- the plan ----------
+echo
+echo "=================== VERO 4K+ eMMC INSTALL PLAN ==================="
+echo "device .............. $DEVICE  ($((SECTORS*512/MiB)) MiB, vendor MPT + bootloader + env verified)"
+echo "running system ...... $ROOT_SRC (boot disk $ROOT_DISK)  -> copied to the eMMC"
+echo "KEPT untouched ...... bootloader (0-4MiB), reserved/MPT (36-100MiB), env (628MiB), logo, recovery, rsv, tee,"
+echo "                      crypt, misc, boot  [verified by checksum before/after]"
+echo "WIPED ............... $lvm_msg; everything from 836MiB on, plus"
+echo "                      the stale PV label of the old 'cache' partition at 108MiB"
+echo "WRITTEN to sector 0 . bytes 446-511 only (DOS partition table); vendor MPT is NOT modified"
+echo "CREATED ............. ${DEVICE}p1  FAT32 /boot  @ ${P1_START_MIB}MiB, ${P1_SIZE_MIB}MiB"
+echo "                      ${DEVICE}p2  ext4  root   @ ${P2_START_MIB}MiB, $((P2_SECTORS*512/MiB))MiB"
+echo "backup .............. $([ "$NO_BACKUP" = 1 ] && echo NONE || echo "$BACKUP_DIR (first 836MiB of the eMMC)")"
+echo "==================================================================="
+[ "$DRY" = 1 ] && { say "dry run: all guards passed, nothing was written"; exit 0; }
+
+# ---------- backup ----------
+if [ "$NO_BACKUP" = 1 ]; then
+  [ "$YES" = 1 ] && [ "$DEVICE_GIVEN" = 1 ] || { read -r -p "No backup will be taken. Type 'NO BACKUP' to continue: " a; [ "$a" = "NO BACKUP" ] || die "aborted"; }
+else
+  [ -n "$BACKUP_DIR" ] || die "give --backup-dir DIR (not on the eMMC) or --no-backup"
+  mkdir -p "$BACKUP_DIR"
+  [ "$(df --output=source "$BACKUP_DIR" | tail -1 | xargs -I{} lsblk -no PKNAME {} 2>/dev/null)" != "$N" ] || die "--backup-dir is on the eMMC"
+  [ "$(df -B1 --output=avail "$BACKUP_DIR" | tail -1)" -gt $((900*MiB)) ] || die "less than 900MiB free in $BACKUP_DIR"
+fi
+
+if [ "$YES" = 1 ] && [ "$DEVICE_GIVEN" = 1 ]; then :; else
+  read -r -p "Type 'WIPE $DEVICE' to wipe OSMC and install Armbian on the eMMC: " a
+  [ "$a" = "WIPE $DEVICE" ] || die "aborted (nothing was written)"
+fi
+
+cleanup() { set +e; sync; mountpoint -q $MNT/boot && umount $MNT/boot; mountpoint -q $MNT && umount $MNT; }
+trap cleanup EXIT
+
+if [ "$NO_BACKUP" != 1 ]; then
+  say "backing up the first 836MiB of $DEVICE to $BACKUP_DIR"
+  dd if="$DEVICE" of="$BACKUP_DIR/emmc-first-836MiB.img" bs=1M count=836 conv=fsync status=none
+  a=$(sha256sum < "$BACKUP_DIR/emmc-first-836MiB.img" | cut -d' ' -f1)
+  b=$(dd if="$DEVICE" bs=1M count=836 status=none | sha256sum | cut -d' ' -f1)
+  [ "$a" = "$b" ] || die "backup does not match the eMMC"
+  echo "$a  emmc-first-836MiB.img" > "$BACKUP_DIR/emmc-first-836MiB.img.sha256"; say "backup verified ($a)"
+fi
+
+# checksums of what we promise to keep
+keep_sum() { { dd if=$DEVICE bs=1 count=446 status=none; dd if=$DEVICE bs=512 skip=1 count=$((4*MiB/512-1)) status=none
+  for r in $KEEP_RANGES; do dd if=$DEVICE bs=1M skip=${r%%:*} count=$(( ${r##*:} - ${r%%:*} )) status=none; done; } | sha256sum | cut -d' ' -f1; }
+BEFORE=$(keep_sum); say "preserved-region checksum before: $BEFORE"
+
+# ---------- wipe the stale LVM labels, write the partition table ----------
+for m in $OLD_PV_MIB; do run dd if=/dev/zero of="$DEVICE" bs=1M seek=$m count=1 conv=fsync,notrunc status=none; done
+SCR=$(mktemp); truncate -s $((SECTORS*512)) "$SCR"
+sfdisk --quiet "$SCR" <<EOF
+label: dos
+unit: sectors
+start=$((P1_START_MIB*MiB/512)), size=$((P1_SIZE_MIB*MiB/512)), type=c
+start=$((P2_START_MIB*MiB/512)), size=$P2_SECTORS, type=83
+EOF
+run dd if="$SCR" of="$DEVICE" bs=1 skip=446 seek=446 count=66 conv=fsync,notrunc status=none
+rm -f "$SCR"
+blockdev --rereadpt "$DEVICE" 2>/dev/null || partprobe "$DEVICE" 2>/dev/null || true
+udevadm settle; sleep 1
+P1=${DEVICE}p1; P2=${DEVICE}p2
+[ -b "$P1" ] && [ -b "$P2" ] || die "partitions did not appear (the table is written; re-run with --reinstall after a reboot)"
+
+# ---------- filesystems and copy ----------
+run mkfs.vfat -F 32 -n ARMBOOT "$P1"
+run mkfs.ext4 -F -q -L armbi_root "$P2"
+mkdir -p $MNT; mount "$P2" $MNT; mkdir -p $MNT/boot; mount "$P1" $MNT/boot
+say "copying the root filesystem (this takes a few minutes)"
+rsync -aHAXx --numeric-ids --info=progress2 \
+  --exclude=/proc/* --exclude=/sys/* --exclude=/dev/* --exclude=/run/* --exclude=/tmp/* --exclude=/mnt/* \
+  --exclude=/media/* --exclude=/lost+found --exclude=/var/log.hdd/* --exclude=/swapfile \
+  --exclude=/ddbr/* --exclude=/var/log/journal / $MNT/
+say "second pass: catching files that changed during the copy"
+rsync -aHAXx --numeric-ids --exclude=/proc/* --exclude=/sys/* --exclude=/dev/* --exclude=/run/* --exclude=/tmp/* \
+  --exclude=/mnt/* --exclude=/media/* --exclude=/lost+found --exclude=/var/log.hdd/* --exclude=/swapfile \
+  --exclude=/ddbr/* --exclude=/var/log/journal / $MNT/ >> "$LOG" 2>&1 || true
+if mountpoint -q /var/log.hdd; then
+  # Armbian's ramlog hides the real /var/log under a tmpfs and exposes it at /var/log.hdd: copy it from there,
+  # otherwise services such as exim4 find no log directory on the new system.
+  say "copying the persistent /var/log (kept in /var/log.hdd by armbian-ramlog)"
+  mkdir -p "$MNT/var/log"
+  rsync -aHAX --numeric-ids --exclude=/journal /var/log.hdd/ "$MNT/var/log/" >> "$LOG" 2>&1 || true
+fi
+say "copying /boot"
+rsync -rltD --no-perms --no-owner --no-group --exclude='System Volume Information' /boot/ $MNT/boot/
+
+# ---------- fix up UUIDs, install emmc_autoscript ----------
+U1=$(blkid -s UUID -o value "$P1"); U2=$(blkid -s UUID -o value "$P2")
+OLD_ROOT=$(findmnt -no UUID /); OLD_BOOT=$(findmnt -no UUID /boot || true)
+sed -i "s/$OLD_ROOT/$U2/g" $MNT/etc/fstab $MNT/boot/armbianEnv.txt
+[ -n "$OLD_BOOT" ] && sed -i "s/$OLD_BOOT/$U1/g" $MNT/etc/fstab
+grep -q "^rootdev=UUID=$U2" $MNT/boot/armbianEnv.txt || die "could not set rootdev in armbianEnv.txt"
+if [ -f /usr/share/armbian/emmc_autoscript.cmd ]; then cp /usr/share/armbian/emmc_autoscript.cmd $MNT/boot/emmc_autoscript.cmd
+else cat > $MNT/boot/emmc_autoscript.cmd <<'AUTOEOF'
+# Chainload the mainline U-Boot (/boot/u-boot.ext) instead of booting from the vendor U-Boot.
+# Escape hatch: a non-empty file named chain.off on the boot partition or on a USB stick skips the
+# chainload. If u-boot.ext is missing or unreadable, the legacy boot below is used instead.
+setenv chain_addr 0x1000000
+setenv chain_ok 1
+usb start
+if fatload usb 0 ${chain_addr} chain.off; then setenv chain_ok 0; fi
+if fatload mmc 1 ${chain_addr} chain.off; then setenv chain_ok 0; fi
+if test ${chain_ok} = 1; then if fatload mmc 1 ${chain_addr} u-boot.ext; then echo Chainloading u-boot.ext; icache off; dcache off; go ${chain_addr}; fi; fi
+# Legacy boot (vendor U-Boot boots the kernel directly)
+setenv env_addr 0x1040000
+setenv initrd_loadaddr 0x13000000
+setenv boot_start 'bootm ${loadaddr} ${initrd_loadaddr} ${dtb_mem_addr}'
+setenv try_boot_start 'if fatload ${devtype} ${devnum} ${loadaddr} uImage; then fatload ${devtype} ${devnum} ${env_addr} armbianEnv.txt && env import -t ${env_addr} ${filesize} && setenv bootargs "root=${rootdev} rootwait rootfstype=ext4 console=ttyS0,115200 console=tty1 consoleblank=0 coherent_pool=2M loglevel=1 libata.force=noncq" && fatload ${devtype} ${devnum} ${dtb_mem_addr} dtb/${fdtfile} && fatload ${devtype} ${devnum} ${initrd_loadaddr} uInitrd && run boot_start; fi'
+setenv devtype mmc
+setenv devnum 1
+run try_boot_start
+AUTOEOF
+fi
+mkimage -C none -A arm -T script -d $MNT/boot/emmc_autoscript.cmd $MNT/boot/emmc_autoscript >/dev/null
+[ -s $MNT/boot/emmc_autoscript ] && [ -s $MNT/boot/u-boot.ext ] || die "emmc_autoscript/u-boot.ext missing on the new /boot"
+
+# ---------- verify ----------
+sync; umount $MNT/boot; umount $MNT; sync
+fsck.vfat -n "$P1" >/dev/null || die "fsck.vfat reports problems on $P1"
+e2fsck -fn "$P2" >/dev/null || die "e2fsck reports problems on $P2"
+AFTER=$(keep_sum)
+[ "$BEFORE" = "$AFTER" ] || die "PRESERVED REGIONS CHANGED (before $BEFORE, after $AFTER): do NOT reboot, restore from the backup"
+say "preserved regions unchanged ($AFTER); filesystems check clean"
+cat <<EOF
+
+Done. Armbian is installed on $DEVICE (root UUID $U2, boot UUID $U1).
+Shut down, REMOVE the SD card / USB drive and power on: the vendor U-Boot runs /boot/emmc_autoscript from the eMMC,
+which chainloads /boot/u-boot.ext (mainline U-Boot) and boots Armbian.
+Escape hatches: boot from SD (the SD is tried first), or put a non-empty chain.off file on /boot to skip the chainload.
+If it does not boot: boot from SD (stock bootloader via the boot@SDC dongle) and restore the backup:
+  dd if=emmc-first-836MiB.img of=$DEVICE bs=1M conv=fsync     (log: $LOG)
+EOF
